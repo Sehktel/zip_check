@@ -1,6 +1,6 @@
 # Папки сборки PyInstaller
 build/
-dist/
+# dist/
 __pycache__/
 *.spec
 
