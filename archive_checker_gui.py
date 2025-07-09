@@ -10,8 +10,10 @@ from PyQt6.QtWidgets import (
     QCheckBox, QGroupBox, QGridLayout, QStyle, QStyleFactory
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QShortcut, QKeySequence
+from PyQt6.QtGui import QShortcut, QKeySequence, QIcon
 from check_archives import ArchiveChecker
+from settings_manager import SettingsManager
+from settings_dialog import SettingsDialog
 import logging
 from pathlib import Path
 import zipfile
@@ -26,6 +28,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Версия программы
+VERSION = "1.0.0"
 
 class ArchiveCheckerWorker(QThread):
     """
@@ -216,15 +221,23 @@ class GUILogHandler(logging.Handler):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Проверка целостности архивов")
+        self.setWindowTitle(f"Проверка целостности архивов v{VERSION}")
         self.setMinimumSize(800, 600)
+        
+        # Устанавливаем иконку
+        icon_path = os.path.join('resources', 'icon.svg')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        
+        # Инициализируем менеджер настроек
+        self.settings_manager = SettingsManager()
         
         # Устанавливаем стиль
         if sys.platform == 'win32':
             QApplication.setStyle(QStyleFactory.create('Fusion'))
         
-        # Определяем оптимальное количество потоков
-        self.max_workers = max(1, multiprocessing.cpu_count() - 1)
+        # Определяем оптимальное количество потоков из настроек
+        self.max_workers = self.settings_manager.get_max_threads()
         
         # Создаем центральный виджет и его layout
         central_widget = QWidget()
@@ -237,11 +250,9 @@ class MainWindow(QMainWindow):
         self.setup_ui(layout)
         self.current_stats = {}
         
-        # Устанавливаем директорию по умолчанию
-        default_dir = Path("D:/Telegram Desktop")
-        if default_dir.exists():
-            self.dir_edit.setText(str(default_dir))
-            
+        # Загружаем настройки
+        self.load_settings()
+        
         # Добавляем горячие клавиши
         self.setup_shortcuts()
 
@@ -260,165 +271,112 @@ class MainWindow(QMainWindow):
         dir_layout = QGridLayout()
         dir_layout.setColumnStretch(1, 1)  # Растягиваем вторую колонку
         
-        # Поле для ввода пути
+        # Поле выбора директории
         self.dir_edit = QLineEdit()
-        self.dir_edit.setPlaceholderText("Путь к директории с архивами")
-        dir_layout.addWidget(self.dir_edit, 0, 0, 1, 2)
-        
-        # Кнопка выбора директории
         self.select_dir_btn = QPushButton("Обзор...")
         self.select_dir_btn.clicked.connect(self.select_directory)
+        dir_layout.addWidget(QLabel("Директория:"), 0, 0)
+        dir_layout.addWidget(self.dir_edit, 0, 1)
         dir_layout.addWidget(self.select_dir_btn, 0, 2)
         
-        # Флажок рекурсивной проверки
-        self.recursive_check = QCheckBox("Проверять поддиректории")
-        self.recursive_check.setChecked(True)
-        dir_layout.addWidget(self.recursive_check, 1, 0)
+        # Поле расширений файлов и кнопка настроек
+        self.ext_edit = QLineEdit()
+        settings_btn = QPushButton("Настройки")
+        settings_btn.clicked.connect(self.show_settings)
+        dir_layout.addWidget(QLabel("Расширения:"), 1, 0)
+        dir_layout.addWidget(self.ext_edit, 1, 1)
+        dir_layout.addWidget(settings_btn, 1, 2)
         
-        # Выбор количества потоков (прижимаем вправо)
-        threads_layout = QHBoxLayout()
-        threads_layout.addStretch()  # Добавляем растяжку слева
-        threads_layout.addWidget(QLabel("Количество потоков:"))
+        # Объединяем все настройки в одну строку
+        options_layout = QHBoxLayout()
+        
+        # Флажок рекурсивной проверки
+        self.recursive_check = QCheckBox("Проверять подпапки")
+        options_layout.addWidget(self.recursive_check)
+        
+        # Выбор формата отчета
+        options_layout.addWidget(QLabel("Формат отчета:"))
+        self.report_format = QComboBox()
+        self.report_format.addItems(["TXT", "CSV", "HTML", "JSON"])
+        options_layout.addWidget(self.report_format)
+        
+        # Добавляем растяжку между элементами
+        options_layout.addStretch()
+        
+        # Выбор количества потоков
+        options_layout.addWidget(QLabel("Количество потоков:"))
         self.threads_combo = QComboBox()
         self.threads_combo.addItems([str(i) for i in range(1, self.max_workers + 1)])
         self.threads_combo.setCurrentText(str(self.max_workers))
-        threads_layout.addWidget(self.threads_combo)
-        threads_layout.setContentsMargins(0, 0, 0, 0)  # Убираем отступы
-        dir_layout.addLayout(threads_layout, 1, 1, 1, 2)
+        options_layout.addWidget(self.threads_combo)
+        
+        dir_layout.addLayout(options_layout, 2, 0, 1, 3)
         
         dir_group.setLayout(dir_layout)
         layout.addWidget(dir_group)
-
-        # Группа настроек форматов
-        formats_group = QGroupBox("Настройки форматов")
-        formats_layout = QGridLayout()
-        formats_layout.setColumnStretch(1, 1)  # Растягиваем вторую колонку
         
-        # Поле для ввода расширений файлов (выравниваем с dir_edit)
-        self.ext_edit = QLineEdit()
-        self.ext_edit.setPlaceholderText("Введите расширения через запятую (например: .zip, .rar, .7z)")
-        self.ext_edit.setText(".zip, .rar, .7z, .r00, .part1.rar, .001")
-        formats_layout.addWidget(self.ext_edit, 0, 0, 1, 2)
-        
-        # Выбор формата отчета (справа)
-        report_layout = QHBoxLayout()
-        report_layout.addStretch()  # Добавляем растяжку слева
-        report_layout.addWidget(QLabel("Формат отчета:"))
-        self.report_format = QComboBox()
-        self.report_format.addItems(["TXT", "CSV", "HTML", "JSON"])
-        report_layout.addWidget(self.report_format)
-        report_layout.setContentsMargins(0, 0, 0, 0)  # Убираем отступы
-        formats_layout.addLayout(report_layout, 0, 2)
-        
-        formats_group.setLayout(formats_layout)
-        layout.addWidget(formats_group)
-
-        # Область вывода лога
+        # Область лога
+        log_group = QGroupBox("Лог проверки")
+        log_layout = QVBoxLayout()
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
-        self.log_area.setStyleSheet("""
-            QTextEdit {
-                font-family: 'Consolas', 'Courier New', monospace;
-                font-size: 10pt;
-                background-color: #f8f9fa;
-                border: 1px solid #dee2e6;
-                border-radius: 4px;
-                padding: 8px;
-            }
-        """)
-        self.log_area.setAcceptRichText(True)
-        layout.addWidget(self.log_area)
-
-        # Метка статистики
-        self.stats_label = QLabel("Статистика проверки:")
-        layout.addWidget(self.stats_label)
-
-        # Прогресс бар
+        log_layout.addWidget(self.log_area)
+        log_group.setLayout(log_layout)
+        layout.addWidget(log_group)
+        
+        # Прогресс и статистика
+        progress_group = QGroupBox("Прогресс и статистика")
+        progress_layout = QVBoxLayout()
+        
+        # Прогресс-бар и метка процента
+        progress_bar_layout = QHBoxLayout()
         self.progress_bar = QProgressBar()
-        self.progress_bar.setTextVisible(True)
         self.progress_bar.hide()
-        layout.addWidget(self.progress_bar)
-        
-        # Метка прогресса
-        self.progress_label = QLabel()
+        progress_bar_layout.addWidget(self.progress_bar)
+        self.progress_label = QLabel("0%")
         self.progress_label.hide()
-        layout.addWidget(self.progress_label)
-
-        # Панель кнопок управления внизу окна
-        button_panel = QHBoxLayout()
+        progress_bar_layout.addWidget(self.progress_label)
+        progress_layout.addLayout(progress_bar_layout)
         
-        # Кнопка "Начать проверку"
+        # Статистика
+        self.stats_label = QLabel("Статистика проверки:")
+        progress_layout.addWidget(self.stats_label)
+        
+        progress_group.setLayout(progress_layout)
+        layout.addWidget(progress_group)
+        
+        # Кнопки управления (разделены на три равные части)
+        buttons_layout = QHBoxLayout()
+        
+        # Левая часть - кнопка "Начать проверку"
+        left_layout = QHBoxLayout()
         self.start_btn = QPushButton("Начать проверку (Ctrl+S)")
-        self.start_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #90EE90;
-                border: 1px solid #4CAF50;
-                padding: 5px;
-                border-radius: 3px;
-                min-width: 150px;
-            }
-            QPushButton:hover {
-                background-color: #98FB98;
-            }
-            QPushButton:pressed {
-                background-color: #32CD32;
-            }
-            QPushButton:disabled {
-                background-color: #D3D3D3;
-                border: 1px solid #A9A9A9;
-            }
-        """)
+        self.start_btn.setStyleSheet("background-color: #98FB98;")  # Салатовый цвет
         self.start_btn.clicked.connect(self.start_check)
-        button_panel.addWidget(self.start_btn)
+        left_layout.addWidget(self.start_btn)
+        left_layout.addStretch()
+        buttons_layout.addLayout(left_layout)
         
-        # Кнопка "Остановить"
-        self.stop_btn = QPushButton("Остановить (Ctrl+X)")
-        self.stop_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FFB6C1;
-                border: 1px solid #FF69B4;
-                padding: 5px;
-                border-radius: 3px;
-                min-width: 150px;
-            }
-            QPushButton:hover {
-                background-color: #FFC0CB;
-            }
-            QPushButton:pressed {
-                background-color: #FF69B4;
-            }
-            QPushButton:disabled {
-                background-color: #D3D3D3;
-                border: 1px solid #A9A9A9;
-            }
-        """)
+        # Центральная часть - кнопка "Остановить"
+        center_layout = QHBoxLayout()
+        center_layout.addStretch()
+        self.stop_btn = QPushButton("Остановить проверку (Ctrl+X)")
         self.stop_btn.clicked.connect(self.stop_check)
-        self.stop_btn.hide()
-        button_panel.addWidget(self.stop_btn)
+        self.stop_btn.hide()  # Изначально скрыта
+        center_layout.addWidget(self.stop_btn)
+        center_layout.addStretch()
+        buttons_layout.addLayout(center_layout)
         
-        button_panel.addStretch()
+        # Правая часть - кнопка "Выход"
+        right_layout = QHBoxLayout()
+        right_layout.addStretch()
+        exit_btn = QPushButton("Выход (Ctrl+Q)")
+        exit_btn.setStyleSheet("background-color: #ff6b6b;")  # Красный цвет
+        exit_btn.clicked.connect(self.confirm_exit)
+        right_layout.addWidget(exit_btn)
+        buttons_layout.addLayout(right_layout)
         
-        # Кнопка "Выход"
-        self.exit_btn = QPushButton("Выход (Ctrl+Q)")
-        self.exit_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #ff6b6b;
-                border: 1px solid #ff4444;
-                padding: 5px;
-                border-radius: 3px;
-                min-width: 150px;
-            }
-            QPushButton:hover {
-                background-color: #ff7777;
-            }
-            QPushButton:pressed {
-                background-color: #ff4444;
-            }
-        """)
-        self.exit_btn.clicked.connect(self.confirm_exit)
-        button_panel.addWidget(self.exit_btn)
-        
-        layout.addLayout(button_panel)
+        layout.addLayout(buttons_layout)
 
     def select_directory(self):
         """
@@ -435,11 +393,35 @@ class MainWindow(QMainWindow):
             self.log_area.clear()
             self.stats_label.setText("Статистика проверки:")
     
+    def load_settings(self):
+        """Загрузка настроек в интерфейс"""
+        # Устанавливаем директорию по умолчанию
+        default_dir = self.settings_manager.get_default_directory()
+        if os.path.exists(default_dir):
+            self.dir_edit.setText(default_dir)
+            
+        # Устанавливаем расширения
+        extensions = self.settings_manager.get_enabled_extensions()
+        self.ext_edit.setText(", ".join(extensions))
+        
+        # Устанавливаем рекурсивную проверку
+        self.recursive_check.setChecked(self.settings_manager.get_recursive_scan())
+        
+        # Устанавливаем количество потоков
+        max_threads = self.settings_manager.get_max_threads()
+        index = self.threads_combo.findText(str(max_threads))
+        if index >= 0:
+            self.threads_combo.setCurrentIndex(index)
+
+    def show_settings(self):
+        """Показ диалога настроек"""
+        dialog = SettingsDialog(self.settings_manager, self)
+        if dialog.exec():
+            self.load_settings()
+
     def get_extensions(self):
-        """Получение списка расширений"""
-        extensions = [ext.strip() for ext in self.ext_edit.text().split(',')]
-        # Добавляем точку в начало расширения, если её нет
-        return [ext if ext.startswith('.') else '.' + ext for ext in extensions if ext]
+        """Получение списка расширений из поля ввода"""
+        return [ext.strip().lower() for ext in self.ext_edit.text().split(",") if ext.strip()]
     
     def stop_check(self):
         """Остановка проверки архивов"""
