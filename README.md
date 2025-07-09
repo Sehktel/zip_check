@@ -36,7 +36,7 @@
 
 1. Клонируйте репозиторий:
 ```bash
-git clone https://github.com/yourusername/archive_checker.git
+git clone https://github.com/Sehktel/zip_check.git
 cd zip_check
 ```
 
