@@ -1,4 +1,4 @@
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 import os
 
 def create_icon(size=256):
@@ -11,48 +11,71 @@ def create_icon(size=256):
     margin = size // 8
     rect_width = size - 2 * margin
     rect_height = int(rect_width * 1.2)
-    draw.rectangle(
-        [margin, margin, margin + rect_width, margin + rect_height],
-        fill='#FFD700',
-        outline='#000000',
-        width=max(1, size // 32)
-    )
+    
+    # Основная часть архива (с закругленными углами)
+    for i in range(margin, margin + rect_width):
+        for j in range(margin, margin + rect_height):
+            # Проверяем, находится ли точка в закругленном прямоугольнике
+            corner_radius = size // 16
+            x_dist = min(i - margin, margin + rect_width - i)
+            y_dist = min(j - margin, margin + rect_height - j)
+            
+            if x_dist < corner_radius and y_dist < corner_radius:
+                # Точка в углу, проверяем расстояние до центра угла
+                corner_x = margin + corner_radius if i < size//2 else margin + rect_width - corner_radius
+                corner_y = margin + corner_radius if j < size//2 else margin + rect_height - corner_radius
+                if ((i - corner_x) ** 2 + (j - corner_y) ** 2) ** 0.5 <= corner_radius:
+                    draw.point((i, j), fill='#FFD700')
+            else:
+                draw.point((i, j), fill='#FFD700')
     
     # Рисуем верхнюю часть архива
     top_height = rect_height // 6
-    draw.rectangle(
-        [margin, margin, margin + rect_width, margin + top_height],
-        fill='#FFED4A',
-        outline='#000000',
-        width=max(1, size // 32)
-    )
+    for i in range(margin, margin + rect_width):
+        for j in range(margin, margin + top_height):
+            corner_radius = size // 32
+            x_dist = min(i - margin, margin + rect_width - i)
+            y_dist = min(j - margin, margin + top_height - j)
+            
+            if x_dist < corner_radius and y_dist < corner_radius:
+                corner_x = margin + corner_radius if i < size//2 else margin + rect_width - corner_radius
+                corner_y = margin + corner_radius if j < size//2 else margin + top_height - corner_radius
+                if ((i - corner_x) ** 2 + (j - corner_y) ** 2) ** 0.5 <= corner_radius:
+                    draw.point((i, j), fill='#FFED4A')
+            else:
+                draw.point((i, j), fill='#FFED4A')
     
     # Рисуем молнию
+    lightning_width = size // 4
+    lightning_height = size // 2
+    center_x = size // 2
+    top_y = margin + top_height + size // 8
+    bottom_y = margin + rect_height - size // 8
+    
     lightning_points = [
-        (size//2, margin + top_height + size//8),  # верх
-        (size//2 + size//6, size//2),  # правый выступ
-        (size//2, size//2),  # центр
-        (size//2 + size//8, size - margin - size//8),  # низ
-        (size//2 - size//6, size//2),  # левый выступ
-        (size//2, size//2),  # центр
+        (center_x, top_y),  # верхняя точка
+        (center_x + lightning_width//2, (top_y + bottom_y)//2 - lightning_height//4),  # правый выступ
+        (center_x, (top_y + bottom_y)//2),  # центр
+        (center_x + lightning_width//4, bottom_y),  # нижняя точка
+        (center_x - lightning_width//2, (top_y + bottom_y)//2 + lightning_height//4),  # левый выступ
+        (center_x, (top_y + bottom_y)//2),  # центр
     ]
-    draw.polygon(lightning_points, fill='#FF4444', outline='#000000', width=max(1, size // 32))
     
-    # Добавляем текст ZIP
-    font_size = size // 4
-    try:
-        font = ImageFont.truetype("arial.ttf", font_size)
-    except:
-        font = ImageFont.load_default()
+    # Рисуем контур молнии
+    draw.polygon(lightning_points, fill='#FF4444', outline='#CC0000', width=max(1, size // 64))
     
-    text = "ZIP"
-    text_bbox = draw.textbbox((0, 0), text, font=font)
-    text_width = text_bbox[2] - text_bbox[0]
-    text_height = text_bbox[3] - text_bbox[1]
-    
-    text_x = (size - text_width) // 2
-    text_y = size - margin - text_height - size//8
-    draw.text((text_x, text_y), text, font=font, fill='#000000')
+    # Добавляем блики на молнии
+    highlight_points = [
+        (center_x - lightning_width//8, top_y + lightning_height//8),
+        (center_x + lightning_width//4, (top_y + bottom_y)//2 - lightning_height//8),
+        (center_x - lightning_width//8, (top_y + bottom_y)//2 + lightning_height//8)
+    ]
+    for x, y in highlight_points:
+        radius = size // 32
+        for i in range(-radius, radius + 1):
+            for j in range(-radius, radius + 1):
+                if i*i + j*j <= radius*radius:
+                    draw.point((x + i, y + j), fill='#FFAAAA')
     
     return img
 

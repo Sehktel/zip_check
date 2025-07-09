@@ -225,9 +225,13 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(800, 600)
         
         # Устанавливаем иконку
-        icon_path = os.path.join('resources', 'icon.svg')
+        # Сначала пробуем загрузить нашу иконку
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', 'icon.ico')
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
+        else:
+            # Если не удалось, используем стандартную иконку архива
+            self.setWindowIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
         
         # Инициализируем менеджер настроек
         self.settings_manager = SettingsManager()
