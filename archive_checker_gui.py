@@ -9,13 +9,16 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QComboBox, QSpacerItem, QSizePolicy, QLineEdit,
     QCheckBox, QGroupBox, QGridLayout, QStyle, QStyleFactory
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt6.QtGui import QShortcut, QKeySequence
 from check_archives import ArchiveChecker
 import logging
 from pathlib import Path
 import zipfile
 import zlib
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
 
 # Настраиваем логирование
 logging.basicConfig(
@@ -33,7 +36,7 @@ class ArchiveCheckerWorker(QThread):
     finished_signal = pyqtSignal(dict)
     stats_signal = pyqtSignal(dict)
     
-    def __init__(self, directory, extensions, recursive=True):
+    def __init__(self, directory, extensions, recursive=True, max_workers=None):
         super().__init__()
         self.directory = directory
         self.extensions = extensions
@@ -42,6 +45,9 @@ class ArchiveCheckerWorker(QThread):
         self.total_files = 0
         self.processed_files = 0
         self.stop_flag = False
+        self.executor = None  # Сохраняем ссылку на executor
+        # Если max_workers не указано, используем количество ядер процессора
+        self.max_workers = max_workers or max(1, multiprocessing.cpu_count() - 1)
         
         # Создаем handler для отправки логов в GUI
         self.log_handler = GUILogHandler(self.progress_signal)
@@ -52,6 +58,17 @@ class ArchiveCheckerWorker(QThread):
         """Остановка проверки"""
         self.stop_flag = True
         self.logger.info("Остановка проверки...")
+        if self.executor:
+            self.executor.shutdown(wait=False)  # Принудительно завершаем все задачи
+
+    def force_stop(self):
+        """Принудительная остановка всех процессов"""
+        self.stop_flag = True
+        if self.executor:
+            # Принудительно завершаем все задачи
+            self.executor.shutdown(wait=False)
+        # Принудительно завершаем текущий поток
+        self.terminate()
 
     def count_archives(self):
         """
@@ -66,6 +83,67 @@ class ArchiveCheckerWorker(QThread):
             count = sum(1 for f in files if any(f.lower().endswith(ext.lower()) for ext in self.extensions))
         return count
 
+    def process_archive(self, file_path, checker):
+        """
+        Обработка одного архива в отдельном потоке
+        """
+        if self.stop_flag:
+            return None
+            
+        # Определяем метод проверки
+        check_methods = {
+            '.zip': checker.check_zip,
+            '.7z': checker.check_7z,
+            '.rar': checker.check_rar,
+            '.r00': checker.check_rar,
+            '.part1.rar': checker.check_rar,
+            '.001': checker.check_rar
+        }
+        
+        check_method = None
+        for ext, method in check_methods.items():
+            if file_path.name.lower().endswith(ext):
+                check_method = method
+                break
+        
+        if check_method:
+            try:
+                # Периодически проверяем stop_flag во время проверки
+                checker.stop_flag = self.stop_flag
+                is_valid, error_msg = check_method(file_path)
+                
+                # Проверяем stop_flag после длительной операции
+                if self.stop_flag:
+                    return None
+                
+                # Обновляем прогресс
+                self.processed_files += 1
+                progress = int((self.processed_files / self.total_files) * 100)
+                self.progress_percent_signal.emit(progress)
+                
+                # Обновляем статистику
+                elapsed_time = time.time() - self.start_time
+                stats = {
+                    'total_files': self.total_files,
+                    'processed_files': self.processed_files,
+                    'corrupted_files': 0,  # Будет обновлено позже
+                    'elapsed_time': int(elapsed_time),
+                    'avg_time_per_file': round(elapsed_time / self.processed_files, 2) if self.processed_files > 0 else 0
+                }
+                self.stats_signal.emit(stats)
+                
+                if not is_valid:
+                    self.logger.error(f"Проверка архива: {file_path.name}; Ошибка: {error_msg}")
+                    return str(file_path), error_msg
+                else:
+                    self.logger.info(f"Проверка архива: {file_path.name}; OK!")
+                    return None
+            except Exception as e:
+                if not self.stop_flag:  # Логируем ошибку только если это не остановка
+                    self.logger.error(f"Ошибка при проверке {file_path.name}: {str(e)}")
+                return str(file_path), str(e)
+        return None
+
     def run(self):
         try:
             self.start_time = time.time()
@@ -73,85 +151,57 @@ class ArchiveCheckerWorker(QThread):
             self.processed_files = 0
             self.stop_flag = False
             
-            class ProgressArchiveChecker(ArchiveChecker):
-                def __init__(self, directory, worker):
-                    super().__init__(directory)
-                    self.worker = worker
-                
-                def check_archives(self):
-                    if not self.directory.exists():
-                        raise FileNotFoundError(f"Директория {self.directory} не существует")
-                    
-                    # Создаем словарь методов проверки для каждого типа архива
-                    check_methods = {
-                        '.zip': self.check_zip,
-                        '.7z': self.check_7z,
-                        '.rar': self.check_rar,
-                        '.r00': self.check_rar,  # Многотомные RAR архивы
-                        '.part1.rar': self.check_rar,  # Новый формат многотомных RAR
-                        '.001': self.check_rar  # Другой формат многотомных архивов
-                    }
-                    
-                    # Функция для проверки файла
-                    def check_file(file_path):
-                        if self.worker.stop_flag:
-                            return False
-                            
-                        # Определяем метод проверки
-                        check_method = None
-                        for ext, method in check_methods.items():
-                            if file_path.name.lower().endswith(ext):
-                                check_method = method
-                                break
-                        
-                        if check_method:
-                            is_valid, error_msg = check_method(file_path)
-                            
-                            if not is_valid:
-                                self.corrupted_archives[str(file_path)] = error_msg
-                                self.worker.logger.error(f"Проверка архива: {file_path.name}; Ошибка: {error_msg}")
-                            else:
-                                self.worker.logger.info(f"Проверка архива: {file_path.name}; OK!")
-                            
-                            # Обновляем прогресс
-                            self.worker.processed_files += 1
-                            progress = int((self.worker.processed_files / self.worker.total_files) * 100)
-                            self.worker.progress_percent_signal.emit(progress)
-                            
-                            # Обновляем статистику
-                            elapsed_time = time.time() - self.worker.start_time
-                            stats = {
-                                'total_files': self.worker.total_files,
-                                'processed_files': self.worker.processed_files,
-                                'corrupted_files': len(self.corrupted_archives),
-                                'elapsed_time': int(elapsed_time),
-                                'avg_time_per_file': round(elapsed_time / self.worker.processed_files, 2) if self.worker.processed_files > 0 else 0
-                            }
-                            self.worker.stats_signal.emit(stats)
-                        return not self.worker.stop_flag
-                    
-                    # Обходим файлы
-                    if self.worker.recursive:
-                        for file_path in self.directory.rglob("*"):
-                            if any(file_path.name.lower().endswith(ext.lower()) for ext in self.worker.extensions):
-                                if not check_file(file_path):
-                                    break
-                    else:
-                        for file_path in self.directory.iterdir():
-                            if file_path.is_file() and any(file_path.name.lower().endswith(ext.lower()) for ext in self.worker.extensions):
-                                if not check_file(file_path):
-                                    break
-                    
-                    return self.corrupted_archives
+            checker = ArchiveChecker(self.directory)
+            corrupted_archives = {}
             
-            checker = ProgressArchiveChecker(self.directory, self)
-            corrupted = checker.check_archives()
-            self.finished_signal.emit(corrupted)
+            # Собираем список всех архивов для проверки
+            archives_to_check = []
+            if self.recursive:
+                for file_path in self.directory.rglob("*"):
+                    if any(file_path.name.lower().endswith(ext.lower()) for ext in self.extensions):
+                        archives_to_check.append(file_path)
+            else:
+                for file_path in self.directory.iterdir():
+                    if file_path.is_file() and any(file_path.name.lower().endswith(ext.lower()) for ext in self.extensions):
+                        archives_to_check.append(file_path)
+            
+            # Создаем пул потоков для параллельной обработки
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                self.executor = executor  # Сохраняем ссылку на executor
+                # Запускаем задачи на проверку архивов
+                future_to_archive = {
+                    executor.submit(self.process_archive, archive, checker): archive
+                    for archive in archives_to_check
+                }
+                
+                # Собираем результаты по мере их готовности
+                for future in as_completed(future_to_archive):
+                    if self.stop_flag:
+                        executor.shutdown(wait=False)
+                        break
+                        
+                    result = future.result()
+                    if result:
+                        file_path, error_msg = result
+                        corrupted_archives[file_path] = error_msg
+                        
+                        # Обновляем статистику поврежденных файлов
+                        stats = {
+                            'total_files': self.total_files,
+                            'processed_files': self.processed_files,
+                            'corrupted_files': len(corrupted_archives),
+                            'elapsed_time': int(time.time() - self.start_time),
+                            'avg_time_per_file': round((time.time() - self.start_time) / self.processed_files, 2) if self.processed_files > 0 else 0
+                        }
+                        self.stats_signal.emit(stats)
+            
+            self.finished_signal.emit(corrupted_archives)
             
         except Exception as e:
             self.logger.error(f"Ошибка: {str(e)}")
             self.finished_signal.emit({})
         finally:
+            self.executor = None
             self.logger.removeHandler(self.log_handler)
 
 class GUILogHandler(logging.Handler):
@@ -173,10 +223,16 @@ class MainWindow(QMainWindow):
         if sys.platform == 'win32':
             QApplication.setStyle(QStyleFactory.create('Fusion'))
         
+        # Определяем оптимальное количество потоков
+        self.max_workers = max(1, multiprocessing.cpu_count() - 1)
+        
         # Создаем центральный виджет и его layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
+        
+        # Флаг для отслеживания состояния проверки
+        self.is_checking = False
         
         self.setup_ui(layout)
         self.current_stats = {}
@@ -185,11 +241,24 @@ class MainWindow(QMainWindow):
         default_dir = Path("D:/Telegram Desktop")
         if default_dir.exists():
             self.dir_edit.setText(str(default_dir))
+            
+        # Добавляем горячие клавиши
+        self.setup_shortcuts()
+
+    def setup_shortcuts(self):
+        """Настройка горячих клавиш"""
+        # Ctrl+S для старта проверки
+        QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self.start_check)
+        # Ctrl+X для остановки
+        QShortcut(QKeySequence("Ctrl+X"), self).activated.connect(self.stop_check)
+        # Ctrl+Q для выхода
+        QShortcut(QKeySequence("Ctrl+Q"), self).activated.connect(self.confirm_exit)
 
     def setup_ui(self, layout):
         # Группа настроек директории
         dir_group = QGroupBox("Настройки директории")
         dir_layout = QGridLayout()
+        dir_layout.setColumnStretch(1, 1)  # Растягиваем вторую колонку
         
         # Поле для ввода пути
         self.dir_edit = QLineEdit()
@@ -197,140 +266,285 @@ class MainWindow(QMainWindow):
         dir_layout.addWidget(self.dir_edit, 0, 0, 1, 2)
         
         # Кнопка выбора директории
-        select_dir_btn = QPushButton("Обзор...")
-        select_dir_btn.clicked.connect(self.select_directory)
-        dir_layout.addWidget(select_dir_btn, 0, 2)
+        self.select_dir_btn = QPushButton("Обзор...")
+        self.select_dir_btn.clicked.connect(self.select_directory)
+        dir_layout.addWidget(self.select_dir_btn, 0, 2)
         
         # Флажок рекурсивной проверки
         self.recursive_check = QCheckBox("Проверять поддиректории")
         self.recursive_check.setChecked(True)
         dir_layout.addWidget(self.recursive_check, 1, 0)
         
+        # Выбор количества потоков (прижимаем вправо)
+        threads_layout = QHBoxLayout()
+        threads_layout.addStretch()  # Добавляем растяжку слева
+        threads_layout.addWidget(QLabel("Количество потоков:"))
+        self.threads_combo = QComboBox()
+        self.threads_combo.addItems([str(i) for i in range(1, self.max_workers + 1)])
+        self.threads_combo.setCurrentText(str(self.max_workers))
+        threads_layout.addWidget(self.threads_combo)
+        threads_layout.setContentsMargins(0, 0, 0, 0)  # Убираем отступы
+        dir_layout.addLayout(threads_layout, 1, 1, 1, 2)
+        
         dir_group.setLayout(dir_layout)
         layout.addWidget(dir_group)
+
+        # Группа настроек форматов
+        formats_group = QGroupBox("Настройки форматов")
+        formats_layout = QGridLayout()
+        formats_layout.setColumnStretch(1, 1)  # Растягиваем вторую колонку
         
-        # Группа настроек расширений
-        ext_group = QGroupBox("Расширения архивов")
-        ext_layout = QVBoxLayout()
-        
-        # Поле для ввода расширений
+        # Поле для ввода расширений файлов (выравниваем с dir_edit)
         self.ext_edit = QLineEdit()
-        self.ext_edit.setPlaceholderText("Введите расширения через запятую (например: .zip, .rar, .7z, .r00, .part1.rar, .001)")
+        self.ext_edit.setPlaceholderText("Введите расширения через запятую (например: .zip, .rar, .7z)")
         self.ext_edit.setText(".zip, .rar, .7z, .r00, .part1.rar, .001")
-        ext_layout.addWidget(self.ext_edit)
+        formats_layout.addWidget(self.ext_edit, 0, 0, 1, 2)
         
-        ext_group.setLayout(ext_layout)
-        layout.addWidget(ext_group)
-        
-        # Панель с кнопками и форматом отчета
-        control_panel = QHBoxLayout()
-        
-        # Кнопки управления
-        button_layout = QHBoxLayout()
-        self.check_btn = QPushButton("Начать проверку")
-        self.check_btn.clicked.connect(self.start_check)
-        button_layout.addWidget(self.check_btn)
-        
-        self.stop_btn = QPushButton("Остановить")
-        self.stop_btn.clicked.connect(self.stop_check)
-        self.stop_btn.setEnabled(False)
-        button_layout.addWidget(self.stop_btn)
-        
-        control_panel.addLayout(button_layout)
-        
-        control_panel.addSpacerItem(QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
-        
+        # Выбор формата отчета (справа)
+        report_layout = QHBoxLayout()
+        report_layout.addStretch()  # Добавляем растяжку слева
+        report_layout.addWidget(QLabel("Формат отчета:"))
         self.report_format = QComboBox()
-        self.report_format.addItems(['TXT', 'HTML', 'JSON', 'CSV'])
-        control_panel.addWidget(QLabel("Формат отчета:"))
-        control_panel.addWidget(self.report_format)
+        self.report_format.addItems(["TXT", "CSV", "HTML", "JSON"])
+        report_layout.addWidget(self.report_format)
+        report_layout.setContentsMargins(0, 0, 0, 0)  # Убираем отступы
+        formats_layout.addLayout(report_layout, 0, 2)
         
-        layout.addLayout(control_panel)
-        
-        # Статистика
-        self.stats_label = QLabel("Статистика проверки:")
-        layout.addWidget(self.stats_label)
-        
-        # Прогресс
-        progress_layout = QHBoxLayout()
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.hide()
-        progress_layout.addWidget(self.progress_bar)
-        
-        self.progress_label = QLabel("0%")
-        self.progress_label.hide()
-        progress_layout.addWidget(self.progress_label)
-        
-        layout.addLayout(progress_layout)
-        
-        # Область для логов
+        formats_group.setLayout(formats_layout)
+        layout.addWidget(formats_group)
+
+        # Область вывода лога
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
+        self.log_area.setStyleSheet("""
+            QTextEdit {
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 10pt;
+                background-color: #f8f9fa;
+                border: 1px solid #dee2e6;
+                border-radius: 4px;
+                padding: 8px;
+            }
+        """)
+        self.log_area.setAcceptRichText(True)
         layout.addWidget(self.log_area)
 
+        # Метка статистики
+        self.stats_label = QLabel("Статистика проверки:")
+        layout.addWidget(self.stats_label)
+
+        # Прогресс бар
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
+        
+        # Метка прогресса
+        self.progress_label = QLabel()
+        self.progress_label.hide()
+        layout.addWidget(self.progress_label)
+
+        # Панель кнопок управления внизу окна
+        button_panel = QHBoxLayout()
+        
+        # Кнопка "Начать проверку"
+        self.start_btn = QPushButton("Начать проверку (Ctrl+S)")
+        self.start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #90EE90;
+                border: 1px solid #4CAF50;
+                padding: 5px;
+                border-radius: 3px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #98FB98;
+            }
+            QPushButton:pressed {
+                background-color: #32CD32;
+            }
+            QPushButton:disabled {
+                background-color: #D3D3D3;
+                border: 1px solid #A9A9A9;
+            }
+        """)
+        self.start_btn.clicked.connect(self.start_check)
+        button_panel.addWidget(self.start_btn)
+        
+        # Кнопка "Остановить"
+        self.stop_btn = QPushButton("Остановить (Ctrl+X)")
+        self.stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FFB6C1;
+                border: 1px solid #FF69B4;
+                padding: 5px;
+                border-radius: 3px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #FFC0CB;
+            }
+            QPushButton:pressed {
+                background-color: #FF69B4;
+            }
+            QPushButton:disabled {
+                background-color: #D3D3D3;
+                border: 1px solid #A9A9A9;
+            }
+        """)
+        self.stop_btn.clicked.connect(self.stop_check)
+        self.stop_btn.hide()
+        button_panel.addWidget(self.stop_btn)
+        
+        button_panel.addStretch()
+        
+        # Кнопка "Выход"
+        self.exit_btn = QPushButton("Выход (Ctrl+Q)")
+        self.exit_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ff6b6b;
+                border: 1px solid #ff4444;
+                padding: 5px;
+                border-radius: 3px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #ff7777;
+            }
+            QPushButton:pressed {
+                background-color: #ff4444;
+            }
+        """)
+        self.exit_btn.clicked.connect(self.confirm_exit)
+        button_panel.addWidget(self.exit_btn)
+        
+        layout.addLayout(button_panel)
+
     def select_directory(self):
+        """
+        Выбор директории через диалог
+        """
         directory = QFileDialog.getExistingDirectory(
             self,
             "Выберите директорию с архивами",
-            os.path.expanduser("~")
+            self.dir_edit.text() or str(Path.home())
         )
         if directory:
             self.dir_edit.setText(directory)
-            self.check_btn.setEnabled(True)
+            self.start_btn.setEnabled(True) # Enable start button after selecting directory
             self.log_area.clear()
             self.stats_label.setText("Статистика проверки:")
     
     def get_extensions(self):
-        """Получение списка расширений из поля ввода"""
+        """Получение списка расширений"""
         extensions = [ext.strip() for ext in self.ext_edit.text().split(',')]
-        return [ext if ext.startswith('.') else f'.{ext}' for ext in extensions]
+        # Добавляем точку в начало расширения, если её нет
+        return [ext if ext.startswith('.') else '.' + ext for ext in extensions if ext]
     
     def stop_check(self):
         """Остановка проверки архивов"""
-        if self.worker and self.worker.isRunning():
+        # Проверяем, идет ли проверка
+        if not self.is_checking:
+            return
+            
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            # Сначала пробуем остановить мягко
             self.worker.stop()
             self.stop_btn.setEnabled(False)
-            self.check_btn.setText("Начать проверку")
+            
+            # Даем 3 секунды на мягкую остановку
+            start_time = time.time()
+            while self.worker.isRunning() and (time.time() - start_time) < 3:
+                time.sleep(0.1)
+                QApplication.processEvents()  # Позволяем GUI обновляться
+            
+            # Если поток все еще работает, используем force_stop
+            if self.worker.isRunning():
+                self.worker.force_stop()
+                self.log_area.append('<span style="color: #ff6b6b;">Проверка принудительно остановлена!</span>')
+            else:
+                self.log_area.append('<span style="color: #ff6b6b;">Проверка остановлена.</span>')
+            
+            self.stop_btn.hide()
+            
+            # Включаем элементы управления
+            self.dir_edit.setEnabled(True)
+            self.select_dir_btn.setEnabled(True)
+            self.recursive_check.setEnabled(True)
+            self.threads_combo.setEnabled(True)
+            self.report_format.setEnabled(True)
+            self.ext_edit.setEnabled(True)
+            self.start_btn.setEnabled(True)
+            self.start_btn.setText("Начать проверку (Ctrl+S)")
+            
+            # Сбрасываем флаг проверки
+            self.is_checking = False
 
     def start_check(self):
+        """Запуск проверки архивов"""
+        # Проверяем, не идет ли уже проверка
+        if self.is_checking:
+            return
+            
         directory = self.dir_edit.text()
-        if not directory:
-            QMessageBox.warning(self, "Ошибка", "Выберите директорию для проверки")
+        if not directory or not os.path.exists(directory):
+            QMessageBox.warning(self, "Ошибка", "Выберите существующую директорию")
             return
         
-        extensions = self.get_extensions()
-        if not extensions:
+        # Проверяем наличие расширений
+        if not self.ext_edit.text().strip():
             QMessageBox.warning(self, "Ошибка", "Укажите хотя бы одно расширение файла")
             return
         
-        self.check_btn.setEnabled(False)
+        # Устанавливаем флаг проверки
+        self.is_checking = True
+        
+        # Отключаем элементы управления во время сканирования
+        self.dir_edit.setEnabled(False)
+        self.select_dir_btn.setEnabled(False)
+        self.recursive_check.setEnabled(False)
+        self.threads_combo.setEnabled(False)
+        self.report_format.setEnabled(False)
+        self.ext_edit.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        self.start_btn.setText("Проверка...")
+        self.stop_btn.show()
         self.stop_btn.setEnabled(True)
+        
+        # Очищаем предыдущие результаты
+        self.log_area.clear()
+        self.progress_bar.setValue(0)
         self.progress_bar.show()
         self.progress_label.show()
-        self.progress_bar.setValue(0)
-        self.progress_label.setText("0%")
-        self.log_area.clear()
         
+        # Запускаем проверку в отдельном потоке
         self.worker = ArchiveCheckerWorker(
-            directory,
-            extensions,
-            self.recursive_check.isChecked()
+            Path(directory),
+            self.get_extensions(),
+            self.recursive_check.isChecked(),
+            int(self.threads_combo.currentText())
         )
+        
+        # Подключаем сигналы
         self.worker.progress_signal.connect(self.update_log)
         self.worker.progress_percent_signal.connect(self.update_progress)
-        self.worker.stats_signal.connect(self.update_stats)
         self.worker.finished_signal.connect(self.check_finished)
+        self.worker.stats_signal.connect(self.update_stats)
+        
+        # Запускаем поток
         self.worker.start()
-    
+
     def update_stats(self, stats):
-        self.current_stats = stats
+        """Обновление статистики"""
+        if not hasattr(self, 'stats_label'):
+            return
+            
         stats_text = (
-            f"Всего архивов: {stats['total_files']}\n"
-            f"Проверено: {stats['processed_files']}\n"
-            f"Повреждено: {stats['corrupted_files']}\n"
-            f"Прошло времени: {stats['elapsed_time']} сек\n"
-            f"Среднее время на файл: {stats['avg_time_per_file']} сек"
+            f"Всего файлов: {stats.get('total_files', 0)}\n"
+            f"Обработано файлов: {stats.get('processed_files', 0)}\n"
+            f"Поврежденных файлов: {stats.get('corrupted_files', 0)}\n"
+            f"Затраченное время: {stats.get('elapsed_time', 0)} сек.\n"
+            f"Среднее время на файл: {stats.get('avg_time_per_file', 0)} сек."
         )
         self.stats_label.setText(f"Статистика проверки:\n{stats_text}")
     
@@ -339,9 +553,28 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(f"{percent}%")
     
     def update_log(self, message):
+        """Обновление лога с форматированием"""
+        # Определяем тип сообщения по ключевым словам
+        if "Ошибка" in message:
+            message = f'<span style="color: red;">{message}</span>'
+        elif "OK!" in message:
+            message = f'<span style="color: green;">{message}</span>'
+        elif "Проверка архива" in message:
+            # Форматируем сообщение о проверке
+            parts = message.split(';')
+            if len(parts) == 2:
+                file_info = parts[0].strip()
+                status = parts[1].strip()
+                if "OK!" in status:
+                    status_color = "green"
+                else:
+                    status_color = "red"
+                message = f'<div style="margin: 2px 0;"><span style="color: #0066cc;">{file_info}</span>; <span style="color: {status_color};">{status}</span></div>'
+        
+        # Добавляем сообщение в лог
         self.log_area.append(message)
-        scrollbar = self.log_area.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        # Прокручиваем до последнего сообщения
+        self.log_area.verticalScrollBar().setValue(self.log_area.verticalScrollBar().maximum())
     
     def save_report_txt(self, corrupted_archives, report_path):
         with open(report_path, 'w', encoding='utf-8') as f:
@@ -367,144 +600,295 @@ class MainWindow(QMainWindow):
                 f.write(f"Ошибка: {error}\n")
                 f.write("-" * 50 + "\n")
     
-    def save_report_html(self, corrupted_archives, report_path):
-        html_content = f"""
-        <html>
-        <head>
-            <title>Отчет о проверке архивов</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                h1 {{ color: #333; }}
-                .stats {{ background-color: #f5f5f5; padding: 10px; border-radius: 5px; }}
-                .error {{ color: #d9534f; }}
-                .archive {{ margin: 10px 0; padding: 10px; border: 1px solid #ddd; }}
-            </style>
-        </head>
-        <body>
-            <h1>Отчет о проверке архивов</h1>
-            <p><strong>Дата проверки:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-            <p><strong>Директория:</strong> {self.dir_edit.text()}</p>
-            <p><strong>Расширения:</strong> {', '.join(self.get_extensions())}</p>
-            <p><strong>Рекурсивная проверка:</strong> {'Да' if self.recursive_check.isChecked() else 'Нет'}</p>
-            
-            <h2>Статистика</h2>
-            <div class="stats">
-        """
-        
-        for key, value in self.current_stats.items():
-            html_content += f"<p><strong>{key}:</strong> {value}</p>\n"
-        
-        html_content += """
-            </div>
-            <h2>Поврежденные архивы</h2>
-        """
-        
-        for archive_path, error in corrupted_archives.items():
-            html_content += f"""
-            <div class="archive">
-                <p><strong>Файл:</strong> {archive_path}</p>
-                <p class="error"><strong>Ошибка:</strong> {error}</p>
-            </div>
-            """
-        
-        html_content += """
-        </body>
-        </html>
-        """
-        
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-    
-    def save_report_json(self, corrupted_archives, report_path):
-        report_data = {
-            'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'directory': self.dir_edit.text(),
-            'extensions': self.get_extensions(),
-            'recursive': self.recursive_check.isChecked(),
-            'statistics': self.current_stats,
-            'corrupted_archives': {
-                path: error for path, error in corrupted_archives.items()
-            }
-        }
-        
-        with open(report_path, 'w', encoding='utf-8') as f:
-            json.dump(report_data, f, ensure_ascii=False, indent=2)
-
     def save_report_csv(self, corrupted_archives, report_path):
-        """
-        Сохранение отчета в CSV формате
-        """
-        with open(report_path, 'w', encoding='utf-8') as f:
-            # Заголовок
-            f.write("Файл;Статус;Описание ошибки\n")
+        """Сохранение отчета в формате CSV"""
+        try:
+            with open(report_path, 'w', encoding='utf-8', newline='') as f:
+                # Записываем заголовки
+                f.write("Путь к файлу,Тип ошибки,Дата проверки\n")
+                
+                # Записываем данные
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                for archive_path, error in corrupted_archives.items():
+                    f.write(f'"{archive_path}","{error}","{current_time}"\n')
             
-            # Проходим по всем файлам в директории
-            for root, _, files in os.walk(self.dir_edit.text()):
-                for file in files:
-                    if any(file.lower().endswith(ext.lower()) for ext in self.get_extensions()):
-                        full_path = os.path.join(root, file)
-                        if full_path in corrupted_archives:
-                            f.write(f"{full_path};Ошибка;{corrupted_archives[full_path]}\n")
-                        else:
-                            f.write(f"{full_path};OK;\n")
+            self.log_area.append(f"Отчет сохранен в {report_path}")
+            return True
+        except Exception as e:
+            self.log_area.append(f"Ошибка при сохранении отчета: {str(e)}")
+            return False
+
+    def save_report_json(self, corrupted_archives, report_path):
+        """Сохранение отчета в текстовом формате, похожем на JSON"""
+        try:
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            report_data = {
+                "scan_date": current_time,
+                "total_files": self.current_stats.get('total_files', 0),
+                "processed_files": self.current_stats.get('processed_files', 0),
+                "corrupted_files": len(corrupted_archives),
+                "corrupted_archives": [
+                    {
+                        "path": str(path),
+                        "error": error
+                    }
+                    for path, error in corrupted_archives.items()
+                ]
+            }
+            
+            with open(report_path, 'w', encoding='utf-8') as f:
+                # Используем текстовый формат, похожий на JSON
+                f.write("{\n")
+                f.write(f'    "scan_date": "{report_data["scan_date"]}",\n')
+                f.write(f'    "total_files": {report_data["total_files"]},\n')
+                f.write(f'    "processed_files": {report_data["processed_files"]},\n')
+                f.write(f'    "corrupted_files": {report_data["corrupted_files"]},\n')
+                f.write('    "corrupted_archives": [\n')
+                
+                # Записываем информацию о каждом поврежденном архиве
+                for i, archive in enumerate(report_data["corrupted_archives"]):
+                    f.write('        {\n')
+                    f.write(f'            "path": "{archive["path"]}",\n')
+                    f.write(f'            "error": "{archive["error"]}"\n')
+                    f.write('        }' + (',' if i < len(report_data["corrupted_archives"]) - 1 else '') + '\n')
+                
+                f.write('    ]\n')
+                f.write("}\n")
+            
+            self.log_area.append(f"Отчет сохранен в {report_path}")
+            return True
+        except Exception as e:
+            self.log_area.append(f"Ошибка при сохранении отчета: {str(e)}")
+            return False
+
+    def save_report_html(self, corrupted_archives, report_path):
+        """Сохранение отчета в формате HTML"""
+        try:
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            html_content = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Отчет о проверке архивов</title>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }}
+        h1 {{
+            color: #333;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+        }}
+        .stats {{
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }}
+        th, td {{
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }}
+        th {{
+            background-color: #f8f9fa;
+            font-weight: bold;
+        }}
+        tr:hover {{
+            background-color: #f5f5f5;
+        }}
+        .error {{
+            color: #dc3545;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Отчет о проверке архивов</h1>
+        <div class="stats">
+            <p><strong>Дата проверки:</strong> {current_time}</p>
+            <p><strong>Всего файлов:</strong> {self.current_stats.get('total_files', 0)}</p>
+            <p><strong>Обработано файлов:</strong> {self.current_stats.get('processed_files', 0)}</p>
+            <p><strong>Найдено поврежденных архивов:</strong> {len(corrupted_archives)}</p>
+        </div>
+        
+        <h2>Список поврежденных архивов</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>№</th>
+                    <th>Путь к файлу</th>
+                    <th>Описание ошибки</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+            
+            # Добавляем информацию о каждом поврежденном архиве
+            for i, (archive_path, error) in enumerate(corrupted_archives.items(), 1):
+                html_content += f"""
+                <tr>
+                    <td>{i}</td>
+                    <td>{archive_path}</td>
+                    <td class="error">{error}</td>
+                </tr>"""
+            
+            html_content += """
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
+"""
+            
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            
+            self.log_area.append(f"Отчет сохранен в {report_path}")
+            return True
+        except Exception as e:
+            self.log_area.append(f"Ошибка при сохранении отчета: {str(e)}")
+            return False
 
     def check_finished(self, corrupted_archives):
-        self.progress_bar.hide()
-        self.progress_label.hide()
-        self.check_btn.setEnabled(True)
+        """Обработка завершения проверки"""
+        # Включаем элементы управления
+        self.dir_edit.setEnabled(True)
+        self.select_dir_btn.setEnabled(True)
+        self.recursive_check.setEnabled(True)
+        self.threads_combo.setEnabled(True)
+        self.report_format.setEnabled(True)
+        self.ext_edit.setEnabled(True)
+        self.start_btn.setEnabled(True)
+        self.start_btn.setText("Начать проверку (Ctrl+S)")
+        self.stop_btn.hide()
         self.stop_btn.setEnabled(False)
         
+        # Сбрасываем флаг проверки
+        self.is_checking = False
+        
+        # Скрываем прогресс-бар
+        self.progress_bar.hide()
+        self.progress_label.hide()
+        
+        # Выводим статистику
         total_files = self.current_stats.get('total_files', 0)
-        if self.worker.stop_flag:
-            msg = QMessageBox()
-            msg.setIcon(QMessageBox.Icon.Information)
-            msg.setWindowTitle("Проверка остановлена")
-            msg.setText(f"Проверка была остановлена.\nПроверено {self.current_stats.get('processed_files', 0)} из {total_files} файлов.")
-            msg.exec()
-        elif corrupted_archives:
-            msg = QMessageBox()
-            msg.setIcon(QMessageBox.Icon.Warning)
-            msg.setWindowTitle("Результаты проверки")
-            msg.setText(f"Найдено {len(corrupted_archives)} поврежденных архивов!")
-            
-            details = "Подробная информация:\n\n"
-            for path, error in corrupted_archives.items():
-                details += f"Файл: {path}\nОшибка: {error}\n{'='*50}\n"
-            
-            msg.setDetailedText(details)
-            msg.exec()
-            
-            # Сохраняем отчет в выбранном формате
-            format_ext = self.report_format.currentText().lower()
-            report_path = os.path.join(
-                self.dir_edit.text(),
-                f"corrupted_archives_report.{format_ext}"
-            )
-            
-            save_methods = {
-                'txt': self.save_report_txt,
-                'html': self.save_report_html,
-                'json': self.save_report_json,
-                'csv': self.save_report_csv
-            }
-            
-            save_methods[format_ext](corrupted_archives, report_path)
-            self.update_log(f"\nОтчет сохранен в файл: {report_path}")
-        else:
-            QMessageBox.information(
+        processed_files = self.current_stats.get('processed_files', 0)
+        elapsed_time = self.current_stats.get('elapsed_time', 0)
+        avg_time = self.current_stats.get('avg_time_per_file', 0)
+        
+        stats_text = (
+            f"\nПроверка завершена!\n"
+            f"Всего файлов: {total_files}\n"
+            f"Обработано файлов: {processed_files}\n"
+            f"Поврежденных архивов: {len(corrupted_archives)}\n"
+            f"Затраченное время: {elapsed_time} сек.\n"
+            f"Среднее время на файл: {avg_time} сек.\n"
+        )
+        self.log_area.append(stats_text)
+        
+        # Если есть поврежденные архивы, предлагаем сохранить отчет
+        if corrupted_archives:
+            reply = QMessageBox.question(
                 self,
-                "Результаты проверки",
-                "Все архивы корректны!"
+                "Сохранить отчет",
+                "Найдены поврежденные архивы. Хотите сохранить отчет?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # Создаем диалог сохранения файла
+                file_dialog = QFileDialog(self)
+                file_dialog.setWindowTitle("Сохранить отчет")
+                file_dialog.setNameFilter(
+                    "Text Files (*.txt);;CSV Files (*.csv);;HTML Files (*.html);;Plain JSON (*.json)"
+                )
+                file_dialog.setDefaultSuffix("txt")
+                
+                if file_dialog.exec() == QFileDialog.DialogCode.Accepted:
+                    file_path = file_dialog.selectedFiles()[0]
+                    file_format = file_dialog.selectedNameFilter()
+                    
+                    # Определяем формат по расширению
+                    if file_path.lower().endswith('.txt'):
+                        success = self.save_report_txt(corrupted_archives, file_path)
+                    elif file_path.lower().endswith('.csv'):
+                        success = self.save_report_csv(corrupted_archives, file_path)
+                    elif file_path.lower().endswith('.html'):
+                        success = self.save_report_html(corrupted_archives, file_path)
+                    elif file_path.lower().endswith('.json'):
+                        success = self.save_report_json(corrupted_archives, file_path)
+                    
+                    if not success:
+                        QMessageBox.warning(
+                            self,
+                            "Ошибка",
+                            "Не удалось сохранить отчет. Проверьте права доступа к файлу."
+                        )
+
+    def confirm_exit(self):
+        """Подтверждение выхода из программы"""
+        reply = QMessageBox.question(
+            self,
+            'Подтверждение выхода',
+            'Вы уверены, что хотите выйти из программы?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # Если идет проверка, останавливаем её
+            if hasattr(self, 'worker') and self.worker.isRunning():
+                self.worker.force_stop()
+                self.worker.wait(100)
+            QApplication.quit()
+
+    def closeEvent(self, event):
+        """Обработка закрытия окна"""
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            reply = QMessageBox.question(
+                self,
+                'Подтверждение выхода',
+                'Проверка архивов еще выполняется. Вы уверены, что хотите выйти?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # Принудительно останавливаем все процессы
+                self.worker.force_stop()
+                # Ждем небольшую паузу для завершения процессов
+                self.worker.wait(100)
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
 
 class ArchiveChecker:
-    """
-    Базовый класс для проверки архивов
-    """
+    """Класс для проверки целостности архивов"""
+    
     def __init__(self, directory):
-        self.directory = Path(directory)
-        self.corrupted_archives = {}
-
+        self.directory = directory
+        self.stop_flag = False  # Флаг для остановки проверки
+        
     def find_multipart_files(self, base_file):
         """
         Поиск всех частей многотомного архива
@@ -572,109 +956,78 @@ class ArchiveChecker:
         return True, ""
 
     def check_zip(self, file_path):
-        """
-        Проверка ZIP архива
-        """
+        """Проверка ZIP архива"""
         try:
             with zipfile.ZipFile(file_path, 'r') as zip_file:
-                # Проверяем, не является ли архив многотомным
-                if zip_file.comment and b'span multiple disks' in zip_file.comment:
-                    # Ищем все части архива
-                    parts = self.find_multipart_files(file_path)
-                    if parts:
-                        # Проверяем последовательность частей
-                        is_sequence_valid, error_msg = self.check_multipart_sequence(parts)
-                        if not is_sequence_valid:
-                            return False, f"Многотомный ZIP архив: {error_msg}"
-                        return False, "Многотомный ZIP архив. Все части найдены, но формат не поддерживается. Используйте RAR или 7z."
-                    return False, "Многотомный ZIP архив: не найдены все части архива"
-                
                 # Проверяем каждый файл в архиве
                 for file_info in zip_file.infolist():
-                    if file_info.filename.endswith('/'):  # пропускаем директории
-                        continue
+                    if self.stop_flag:  # Проверяем флаг остановки
+                        return False, "Проверка прервана пользователем"
                     try:
-                        # Проверяем CRC файла
+                        # Проверяем CRC32
                         with zip_file.open(file_info.filename) as f:
-                            while f.read(8192):  # читаем файл блоками по 8KB
-                                pass
+                            while f.read(8192):  # Читаем по частям
+                                if self.stop_flag:  # Проверяем флаг остановки
+                                    return False, "Проверка прервана пользователем"
                     except (zipfile.BadZipFile, zlib.error) as e:
-                        return False, f"Ошибка при проверке файла {file_info.filename}: {str(e)}"
-                return True, ""
+                        return False, f"Ошибка CRC в файле {file_info.filename}: {str(e)}"
+                return True, None
         except zipfile.BadZipFile as e:
-            if 'span multiple disks' in str(e):
-                # Ищем все части архива
-                parts = self.find_multipart_files(file_path)
-                if parts:
-                    # Проверяем последовательность частей
-                    is_sequence_valid, error_msg = self.check_multipart_sequence(parts)
-                    if not is_sequence_valid:
-                        return False, f"Многотомный ZIP архив: {error_msg}"
-                    return False, "Многотомный ZIP архив. Все части найдены, но формат не поддерживается. Используйте RAR или 7z."
-                return False, "Многотомный ZIP архив: не найдены все части архива"
             return False, f"Поврежденный ZIP архив: {str(e)}"
         except Exception as e:
-            return False, str(e)
-
-    def check_rar(self, file_path):
-        """
-        Проверка RAR архива
-        """
-        try:
-            # Проверяем, является ли файл частью многотомного архива
-            if any(pattern in file_path.name.lower() for pattern in ['.part', '.r00', '.001']):
-                parts = self.find_multipart_files(file_path)
-                is_sequence_valid, error_msg = self.check_multipart_sequence(parts)
-                if not is_sequence_valid:
-                    return False, f"Многотомный RAR архив: {error_msg}"
-                
-                # Используем первую часть для проверки
-                file_path = parts[0]
+            return False, f"Ошибка при проверке архива: {str(e)}"
             
-            # Проверяем архив с помощью unrar
+    def check_rar(self, file_path):
+        """Проверка RAR архива"""
+        try:
+            # Проверяем наличие мультичастей
+            parts = self.find_multipart_files(file_path)
+            if parts:
+                if self.stop_flag:  # Проверяем флаг остановки
+                    return False, "Проверка прервана пользователем"
+                return self.check_multipart_sequence(parts)
+            
+            # Проверяем с помощью unrar
             result = subprocess.run(
-                ['unrar', 't', str(file_path)],
+                ['unrar', 't', '-inul', str(file_path)],
                 capture_output=True,
                 text=True
             )
             
-            if result.returncode != 0:
-                error_msg = result.stderr or result.stdout
-                return False, f"Ошибка при проверке RAR архива: {error_msg}"
-            
-            return True, ""
-        except Exception as e:
-            return False, str(e)
-
-    def check_7z(self, file_path):
-        """
-        Проверка 7Z архива
-        """
-        try:
-            # Проверяем, является ли файл частью многотомного архива
-            if '.001' in file_path.name.lower():
-                parts = self.find_multipart_files(file_path)
-                is_sequence_valid, error_msg = self.check_multipart_sequence(parts)
-                if not is_sequence_valid:
-                    return False, f"Многотомный 7Z архив: {error_msg}"
+            if self.stop_flag:  # Проверяем флаг остановки
+                return False, "Проверка прервана пользователем"
                 
-                # Используем первую часть для проверки
-                file_path = parts[0]
+            if result.returncode != 0:
+                return False, f"Ошибка в RAR архиве: {result.stderr}"
+            return True, None
+        except Exception as e:
+            return False, f"Ошибка при проверке архива: {str(e)}"
             
-            # Проверяем архив с помощью 7z
+    def check_7z(self, file_path):
+        """Проверка 7Z архива"""
+        try:
+            # Проверяем наличие мультичастей
+            parts = self.find_multipart_files(file_path)
+            if parts:
+                if self.stop_flag:  # Проверяем флаг остановки
+                    return False, "Проверка прервана пользователем"
+                return self.check_multipart_sequence(parts)
+            
+            # Проверяем с помощью 7z
             result = subprocess.run(
                 ['7z', 't', str(file_path)],
                 capture_output=True,
                 text=True
             )
             
+            if self.stop_flag:  # Проверяем флаг остановки
+                return False, "Проверка прервана пользователем"
+                
             if result.returncode != 0:
-                error_msg = result.stderr or result.stdout
-                return False, f"Ошибка при проверке 7Z архива: {error_msg}"
-            
-            return True, ""
+                return False, f"Ошибка в 7Z архиве: {result.stderr}"
+            return True, None
         except Exception as e:
-            return False, str(e)
+            return False, f"Ошибка при проверке архива: {str(e)}"
 
 def main():
     try:
